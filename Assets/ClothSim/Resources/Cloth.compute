@@ -1,0 +1,287 @@
+#pragma kernel UpdateCloth
+
+StructuredBuffer<float3> prevPosition;
+StructuredBuffer<float3> prevVelocity;
+RWStructuredBuffer<float3> newPosition;
+RWStructuredBuffer<float3> newVelocity;
+
+int width, height;
+int pinMode;
+float deltaTime;
+float kd, ks, kb, r;
+float k_air;
+float mass;
+float3 gravity;
+float friction;
+float kr;
+float collisionGain;
+float collisionThickness;
+
+struct GpuCollider
+{
+    float3 pos;
+    float type;
+    float3 posPrev;
+    float pad0;
+    float3 halfExt;
+    float pad1;
+};
+
+StructuredBuffer<GpuCollider> colliders;
+int colliderCount;
+
+float3 wind;
+
+bool IsPinned(uint x, uint y)
+{
+    if (pinMode == 3) return false;
+    if (pinMode == 1) return y == (uint)(height - 1);
+    if (pinMode == 2) return y == (uint)(height - 1) && (x == 0 || x == (uint)(width - 1));
+    return x == (uint)(width - 1);
+}
+
+void AddSpring(inout float3 force, uint2 id, int ox, int oy, float restMul, float stiff)
+{
+    int nx = (int)id.x + ox;
+    int ny = (int)id.y + oy;
+    if (nx < 0 || nx >= width || ny < 0 || ny >= height) return;
+
+    float rest = r * restMul;
+    uint self = id.y * width + id.x;
+    uint other = ny * width + nx;
+    float3 dx = prevPosition[other] - prevPosition[self];
+    float len = length(dx);
+    if (len < 0.001) return;
+    if (isnan(len) || isinf(len)) return;
+
+    float3 ndx = dx / len;
+    float3 dv = prevVelocity[other] - prevVelocity[self];
+    float _ks = stiff * r / rest;
+    float _kd = kd * r / rest;
+    force += (_ks * (len - rest) + _kd * dot(dv, ndx)) * ndx;
+}
+
+void ProjectContact(inout float3 pos, inout float3 vel, float3 n, float penetration, float3 vCollider)
+{
+    float ln = length(n);
+    if (ln < 0.0001) return;
+    n /= ln;
+    if (penetration <= 0) return;
+
+    float gain = clamp(collisionGain, 1.0, 1.35);
+    pos += n * (penetration * gain + 0.0005);
+
+    vCollider = clamp(vCollider, float3(-8, -8, -8), float3(8, 8, 8));
+    float vRelN = dot(vel - vCollider, n);
+    if (vRelN < 0)
+        vel -= n * vRelN;
+
+    float3 vt = vel - n * dot(vel, n);
+    vel = n * dot(vel, n) + vt * saturate(1.0 - friction);
+}
+
+float ClosestT(float3 p, float3 c0, float3 c1)
+{
+    float3 ab = c1 - c0;
+    float ab2 = dot(ab, ab);
+    if (ab2 < 1e-8) return 1;
+    return saturate(dot(p - c0, ab) / ab2);
+}
+
+float3 ColliderVelocity(float3 curr, float3 prev)
+{
+    float3 move = curr - prev;
+    if (length(move) < 1e-5 || deltaTime < 1e-6) return float3(0, 0, 0);
+    return clamp(move / deltaTime, float3(-30, -30, -30), float3(30, 30, 30));
+}
+
+bool SphereHit(float3 pos, float3 prevPos, float3 c0, float3 c1, float rad)
+{
+    float t = ClosestT(pos, c0, c1);
+    if (length(pos - lerp(c0, c1, t)) < rad)
+        return true;
+
+    float3 a = prevPos - c0;
+    float3 b = pos - c1;
+    float3 ab = b - a;
+    float ab2 = dot(ab, ab);
+    float tr = ab2 < 1e-10 ? 0 : saturate(dot(-a, ab) / ab2);
+    return length(lerp(a, b, tr)) < rad;
+}
+
+void ProjectSphere(inout float3 pos, inout float3 vel, float3 c, float3 cPrev, float rad)
+{
+    float3 d = pos - c;
+    float dist = length(d);
+    if (dist >= rad) return;
+    if (dist < 1e-4)
+        d = length(c - cPrev) > 1e-4 ? (c - cPrev) : float3(0, 1, 0);
+    ProjectContact(pos, vel, d, rad - dist, ColliderVelocity(c, cPrev));
+}
+
+bool BoxHit(float3 pos, float3 prevPos, float3 c0, float3 c1, float3 halfExt)
+{
+    float3 move = c1 - c0;
+    float3 sweptHalf = halfExt + 0.5 * abs(move);
+    float3 sweptC = 0.5 * (c1 + c0);
+    if (all(abs(pos - sweptC) <= sweptHalf)) return true;
+    if (all(abs(prevPos - sweptC) <= sweptHalf)) return true;
+    return false;
+}
+
+void ProjectBox(inout float3 pos, inout float3 vel, float3 c, float3 cPrev, float3 halfExt)
+{
+    float3 local = pos - c;
+    float3 absL = abs(local);
+    if (absL.x > halfExt.x || absL.y > halfExt.y || absL.z > halfExt.z)
+        return;
+
+    float3 pen = halfExt - absL;
+    float3 n = float3(0, 1, 0);
+    float pene = pen.y;
+    if (pen.x < pene) { pene = pen.x; n = float3(local.x >= 0 ? 1 : -1, 0, 0); }
+    if (pen.z < pene) { pene = pen.z; n = float3(0, 0, local.z >= 0 ? 1 : -1); }
+    if (pen.y <= pene + 0.0001) { pene = pen.y; n = float3(0, local.y >= 0 ? 1 : -1, 0); }
+    ProjectContact(pos, vel, n, pene, ColliderVelocity(c, cPrev));
+}
+
+bool CylHit(float3 pos, float3 prevPos, float3 c0, float3 c1, float rad, float halfH)
+{
+    float t = ClosestT(pos, c0, c1);
+    float3 c = lerp(c0, c1, t);
+    float dist = length(pos.xz - c.xz);
+    if (dist < rad && abs(pos.y - c.y) < halfH)
+        return true;
+
+    t = ClosestT(prevPos, c0, c1);
+    c = lerp(c0, c1, t);
+    dist = length(prevPos.xz - c.xz);
+    return dist < rad && abs(prevPos.y - c.y) < halfH;
+}
+
+void ProjectCyl(inout float3 pos, inout float3 vel, float3 c, float3 cPrev, float rad, float halfH)
+{
+    float2 d = pos.xz - c.xz;
+    float dist = length(d);
+    float yLocal = pos.y - c.y;
+    float radial = dist - rad;
+    float axial = abs(yLocal) - halfH;
+    if (radial >= 0 || axial >= 0) return;
+
+    float3 n;
+    float pene;
+    if (dist < 1e-4)
+    {
+        n = float3(0, yLocal >= 0 ? 1 : -1, 0);
+        pene = -axial;
+    }
+    else if (-radial < -axial)
+    {
+        n = float3(d.x, 0, d.y);
+        pene = -radial;
+    }
+    else
+    {
+        n = float3(0, yLocal >= 0 ? 1 : -1, 0);
+        pene = -axial;
+    }
+    ProjectContact(pos, vel, n, pene, ColliderVelocity(c, cPrev));
+}
+
+void ResolveOne(inout float3 newPos, inout float3 newVel, float3 prevPos, bool carry, GpuCollider c, float skin)
+{
+    int t = (int)c.type;
+    if (t == 0)
+    {
+        float rad = c.halfExt.x + skin;
+        if (carry && SphereHit(newPos, prevPos, c.posPrev, c.pos, rad))
+            newPos += c.pos - c.posPrev;
+        ProjectSphere(newPos, newVel, c.pos, c.posPrev, rad);
+    }
+    else if (t == 1)
+    {
+        float3 halfExt = c.halfExt + skin;
+        if (carry && BoxHit(newPos, prevPos, c.posPrev, c.pos, halfExt))
+            newPos += c.pos - c.posPrev;
+        ProjectBox(newPos, newVel, c.pos, c.posPrev, halfExt);
+    }
+    else
+    {
+        float rad = c.halfExt.x + skin;
+        float halfH = c.halfExt.y + skin;
+        if (carry && CylHit(newPos, prevPos, c.posPrev, c.pos, rad, halfH))
+            newPos += c.pos - c.posPrev;
+        ProjectCyl(newPos, newVel, c.pos, c.posPrev, rad, halfH);
+    }
+}
+
+void ResolveCollisions(inout float3 newPos, inout float3 newVel, float3 prevPos, bool carry)
+{
+    float skin = max(collisionThickness, 0);
+    int n = min(colliderCount, 24);
+    for (int i = 0; i < n; i++)
+        ResolveOne(newPos, newVel, prevPos, carry, colliders[i], skin);
+
+    if (newPos.y < skin)
+        ProjectContact(newPos, newVel, float3(0, 1, 0), skin - newPos.y, float3(0, 0, 0));
+}
+
+[numthreads(8, 8, 1)]
+void UpdateCloth(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)width || id.y >= (uint)height) return;
+
+    uint index = id.y * width + id.x;
+    float3 prevPos = prevPosition[index];
+    float3 prevVel = prevVelocity[index];
+
+    if (isnan(prevPos.x) || isnan(prevPos.y) || isnan(prevPos.z) ||
+        isinf(prevPos.x) || isinf(prevPos.y) || isinf(prevPos.z))
+    {
+        newPosition[index] = float3(0, 1, 0);
+        newVelocity[index] = float3(0, 0, 0);
+        return;
+    }
+
+    if (IsPinned(id.x, id.y))
+    {
+        newPosition[index] = prevPos;
+        newVelocity[index] = float3(0, 0, 0);
+        return;
+    }
+
+    float3 force = gravity;
+    force -= k_air * prevVel;
+    force += wind;
+
+    uint2 gid = id.xy;
+    AddSpring(force, gid, 1, 0, 1.0, ks);
+    AddSpring(force, gid, -1, 0, 1.0, ks);
+    AddSpring(force, gid, 0, 1, 1.0, ks);
+    AddSpring(force, gid, 0, -1, 1.0, ks);
+    AddSpring(force, gid, 1, 1, 1.414213, ks);
+    AddSpring(force, gid, 1, -1, 1.414213, ks);
+    AddSpring(force, gid, -1, 1, 1.414213, ks);
+    AddSpring(force, gid, -1, -1, 1.414213, ks);
+    AddSpring(force, gid, 2, 0, 2.0, kb);
+    AddSpring(force, gid, -2, 0, 2.0, kb);
+    AddSpring(force, gid, 0, 2, 2.0, kb);
+    AddSpring(force, gid, 0, -2, 2.0, kb);
+
+    float3 newVel = prevVel + force * deltaTime;
+    newVel = clamp(newVel, float3(-12, -12, -12), float3(12, 12, 12));
+    float3 newPos = prevPos + newVel * deltaTime;
+
+    ResolveCollisions(newPos, newVel, prevPos, true);
+    ResolveCollisions(newPos, newVel, prevPos, false);
+
+    if (isnan(newPos.x) || isnan(newPos.y) || isnan(newPos.z) ||
+        isinf(newPos.x) || isinf(newPos.y) || isinf(newPos.z))
+    {
+        newPos = prevPos;
+        newVel = float3(0, 0, 0);
+    }
+
+    newVelocity[index] = newVel;
+    newPosition[index] = newPos;
+}
