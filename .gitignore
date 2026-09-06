@@ -36,3 +36,8 @@ Assets/StreamingAssets/malgun.ttf.meta
 
 imgui.ini
 unity_setup.log
+
+Installer/*.zip
+Installer/*.exe
+Installer/bin/
+Installer/obj/
